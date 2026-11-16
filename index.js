@@ -1,399 +1,185 @@
-/******** INNOVEX PAY ANONYMOUS BOT ********/
-
-
-const BOT_TOKEN = "9194760036:AAF8K_h9RFIMFbMaWgILRoqbCb-UW9a45_s";
-
-const GROUP_ID = "1004378570213";
-
-const ADMIN_IDS = [5673859926];
-
-
-/******** TELEGRAM API ********/
-
-
-function telegram(method, data) {
-
-  const url = "https://api.telegram.org/bot" + BOT_TOKEN + "/" + method;
-
-
-  const response = UrlFetchApp.fetch(url, {
-
-    method: "post",
-
-    contentType: "application/json",
-
-    payload: JSON.stringify(data || {}),
-
-    muteHttpExceptions: true
-
-  });
-
-
-  const result = JSON.parse(response.getContentText());
-
-
-  if (!result.ok) {
-
-    throw new Error(result.description);
-
-  }
-
-
-  return result.result;
-
-}
-
-
-/******** SEND MESSAGE ********/
-
-
-function sendMessage(chatId, text, keyboard) {
-
-  const data = {
-
-    chat_id: chatId,
-
-    text: text
-
-  };
-
-
-  if (keyboard) {
-
-    data.reply_markup = keyboard;
-
-  }
-
-
-  return telegram("sendMessage", data);
-
-}
-
-
-/******** BOT SETUP ********/
-
-
-function setupBot() {
-
-  telegram("deleteWebhook", {
-
-    drop_pending_updates: false
-
-  });
-
-
-  ScriptApp.getProjectTriggers().forEach(trigger => {
-
-    if (trigger.getHandlerFunction() === "checkUpdates") {
-
-      ScriptApp.deleteTrigger(trigger);
-
-    }
-
-  });
-
-
-  ScriptApp.newTrigger("checkUpdates")
-
-    .timeBased()
-
-    .everyMinutes(1)
-
-    .create();
-
-
-  Logger.log("INNOVEX PAY BOT SETUP COMPLETE");
-
-}
-
-
-/******** CHECK UPDATES ********/
-
-
-function checkUpdates() {
-
-  const props = PropertiesService.getScriptProperties();
-
-  const offset = Number(props.getProperty("TG_OFFSET") || 0);
-
-
-  const updates = telegram("getUpdates", {
-
-    offset: offset,
-
-    timeout: 20,
-
-    allowed_updates: ["message", "callback_query"]
-
-  });
-
-
-  updates.forEach(update => {
-
-    try {
-
-      if (update.message) {
-
-        handleMessage(update.message);
-
-      }
-
-
-      if (update.callback_query) {
-
-        handleCallback(update.callback_query);
-
-      }
-
-
-      props.setProperty(
-
-        "TG_OFFSET",
-
-        String(update.update_id + 1)
-
-      );
-
-
-    } catch (error) {
-
-      console.error(error);
-
-      throw error;
-
-    }
-
-  });
-
-}
-
-
-/******** RECEIVE MESSAGE ********/
-
-
-function handleMessage(message) {
-
-  if (!message.chat || message.chat.type !== "private") return;
-
-
-  const chatId = String(message.chat.id);
-
-  const text = message.text || "";
-
-
-  if (!text || text.startsWith("/")) {
-
-    return;
-
-  }
-
-
-  if (ADMIN_IDS.map(String).includes(chatId)) {
-
-    return;
-
-  }
-
-
-  if (text.length > 3500) {
-
-    sendMessage(chatId, "Message is too long. Please send a shorter message.");
-
-    return;
-
-  }
-
-
-  const id = Utilities.getUuid().replace(/-/g, "").slice(0, 16);
-
-
-  const props = PropertiesService.getScriptProperties();
-
-
-  props.setProperty("PENDING_" + id, JSON.stringify({
-
-    text: text,
-
-    status: "pending"
-
-  }));
-
-
-  const keyboard = {
-
-    inline_keyboard: [[
-
-      {
-
-        text: "✅ ACCEPT",
-
-        callback_data: "a:" + id
-
-      },
-
-      {
-
-        text: "❌ REJECT",
-
-        callback_data: "r:" + id
-
-      }
-
-    ]]
-
-  };
-
-
-  ADMIN_IDS.forEach(adminId => {
-
-    sendMessage(
-
-      adminId,
-
-      "📩 NEW ANONYMOUS MESSAGE\n\n" + text,
-
-      keyboard
-
-    );
-
-  });
-
-
-  sendMessage(chatId, "✅ Your message has been submitted for review.");
-
-}
-
-
-/******** ADMIN APPROVAL ********/
-
-
-function handleCallback(query) {
-
-  const adminId = String(query.from.id);
-
-
-  if (!ADMIN_IDS.map(String).includes(adminId)) {
-
-    telegram("answerCallbackQuery", {
-
-      callback_query_id: query.id,
-
-      text: "Not authorized."
-
-    });
-
-    return;
-
-  }
-
-
-  const parts = query.data.split(":");
-
-  const action = parts[0];
-
-  const id = parts[1];
-
-
-  const lock = LockService.getScriptLock();
-
-  lock.waitLock(10000);
-
-
-  try {
-
-    const props = PropertiesService.getScriptProperties();
-
-    const key = "PENDING_" + id;
-
-    const raw = props.getProperty(key);
-
-
-    if (!raw) {
-
-      telegram("answerCallbackQuery", {
-
-        callback_query_id: query.id,
-
-        text: "Message not found."
-
-      });
-
-      return;
-
-    }
-
-
-    const item = JSON.parse(raw);
-
-
-    if (item.status !== "pending") {
-
-      telegram("answerCallbackQuery", {
-
-        callback_query_id: query.id,
-
-        text: "Already processed."
-
-      });
-
-      return;
-
-    }
-
-
-    if (action === "a") {
-
-      telegram("sendMessage", {
-
-        chat_id: GROUP_ID,
-
-        text: "📩 Anonymous Message\n\n" + item.text
-
-      });
-
-
-      item.status = "approved";
-
-
-    } else if (action === "r") {
-
-      item.status = "rejected";
-
-
-    } else {
-
-      return;
-
-    }
-
-
-    props.setProperty(key, JSON.stringify(item));
-
-
-    telegram("editMessageText", {
-
-      chat_id: query.message.chat.id,
-
-      message_id: query.message.message_id,
-
-      text: "Message " + item.status.toUpperCase() + "\n\n" + item.text
-
-    });
-
-
-    telegram("answerCallbackQuery", {
-
-      callback_query_id: query.id,
-
-      text: "Done!"
-
-    });
-
-
-  } finally {
-
-    lock.releaseLock();
-
-  }
-
-}
+import logging
+import os
+import sqlite3
+
+from telegram import Update
+from telegram.error import TelegramError
+from telegram.ext import (
+    Application,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+log = logging.getLogger(__name__)
+
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+ADMIN_ID = int(os.environ["ADMIN_ID"])
+BASE_URL = os.environ["RENDER_EXTERNAL_URL"].rstrip("/")
+PORT = int(os.environ.get("PORT", "10000"))
+WEBHOOK_PATH = "innovex-telegram-webhook"
+
+DB_PATH = os.environ.get("DB_PATH", "/tmp/innovex.db")
+
+
+def init_db():
+    with sqlite3.connect(DB_PATH) as db:
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS replies_map (
+                admin_message_id INTEGER PRIMARY KEY,
+                user_chat_id INTEGER NOT NULL
+            )
+        """)
+
+
+def save_mapping(admin_message_id, user_chat_id):
+    with sqlite3.connect(DB_PATH) as db:
+        db.execute(
+            """INSERT OR REPLACE INTO replies_map
+               (admin_message_id, user_chat_id)
+               VALUES (?, ?)""",
+            (admin_message_id, user_chat_id),
+        )
+
+
+def get_user_chat(admin_message_id):
+    with sqlite3.connect(DB_PATH) as db:
+        row = db.execute(
+            """SELECT user_chat_id FROM replies_map
+               WHERE admin_message_id = ?""",
+            (admin_message_id,),
+        ).fetchone()
+    return row[0] if row else None
+
+
+async def receive_user_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    message = update.effective_message
+    user = update.effective_user
+
+    if not message or not user:
+        return
+
+    if user.id == ADMIN_ID:
+        return
+
+    # Ignore bot commands.
+    if message.text and message.text.startswith("/"):
+        return
+
+    try:
+        header = await context.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=(
+                "📩 INNOVEX SUPPORT\n\n"
+                f"Name: {user.first_name}\n"
+                f"User ID: {user.id}\n"
+                "নিচের মেসেজে Reply করে উত্তর দিন।"
+            ),
+        )
+
+        copied = await context.bot.copy_message(
+            chat_id=ADMIN_ID,
+            from_chat_id=message.chat_id,
+            message_id=message.message_id,
+        )
+
+        save_mapping(copied.message_id, message.chat_id)
+
+        log.info(
+            "Received message from user %s; admin header %s",
+            user.id,
+            header.message_id,
+        )
+
+    except TelegramError:
+        log.exception("Could not forward user message")
+        try:
+            await message.reply_text(
+                "দুঃখিত, এই মুহূর্তে মেসেজ পাঠানো যাচ্ছে না। "
+                "কিছুক্ষণ পর আবার চেষ্টা করুন।"
+            )
+        except TelegramError:
+            log.exception("Could not notify user")
+
+
+async def admin_reply(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    message = update.effective_message
+    user = update.effective_user
+
+    if not message or not user or user.id != ADMIN_ID:
+        return
+
+    if not message.reply_to_message:
+        return
+
+    target_id = message.reply_to_message.message_id
+    user_chat_id = get_user_chat(target_id)
+
+    if not user_chat_id:
+        await message.reply_text(
+            "এই মেসেজের ইউজার খুঁজে পাওয়া যায়নি। "
+            "ইউজারের মূল মেসেজে Reply করুন।"
+        )
+        return
+
+    try:
+        await context.bot.copy_message(
+            chat_id=user_chat_id,
+            from_chat_id=message.chat_id,
+            message_id=message.message_id,
+        )
+        await message.reply_text("✅ উত্তর বটের মাধ্যমে পাঠানো হয়েছে।")
+
+    except TelegramError:
+        log.exception("Could not send admin reply")
+        await message.reply_text(
+            "❌ উত্তর পাঠানো যায়নি। "
+            "ইউজার বটটি Start করেছে কি না যাচাই করুন।"
+        )
+
+
+def main():
+    init_db()
+
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    # Admin replies are processed separately from user messages.
+    app.add_handler(
+        MessageHandler(
+            filters.ChatType.PRIVATE
+            & filters.REPLY
+            & ~filters.COMMAND,
+            admin_reply,
+        ),
+        group=0,
+    )
+
+    app.add_handler(
+        MessageHandler(
+            filters.ChatType.PRIVATE & ~filters.COMMAND,
+            receive_user_message,
+        ),
+        group=1,
+    )
+
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        url_path=WEBHOOK_PATH,
+        webhook_url=BASE_URL,
+        drop_pending_updates=False,
+    )
+
+
+if __name__ == "__main__":
+    main()
