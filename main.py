@@ -19,7 +19,22 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-ADMIN_ID = int(os.environ["ADMIN_ID"])
+
+# Multiple admin IDs, separated by commas.
+raw_admin_ids = os.environ.get(
+    "ADMIN_IDS",
+    os.environ.get("ADMIN_ID", ""),
+)
+
+ADMIN_IDS = {
+    int(item.strip())
+    for item in raw_admin_ids.split(",")
+    if item.strip()
+}
+
+if not ADMIN_IDS:
+    raise ValueError("Set ADMIN_IDS in Render Environment.")
+
 BASE_URL = os.environ["RENDER_EXTERNAL_URL"].rstrip("/")
 PORT = int(os.environ.get("PORT", "10000"))
 WEBHOOK_PATH = "innovex-telegram-webhook"
@@ -29,40 +44,54 @@ DB_PATH = os.environ.get("DB_PATH", "/tmp/innovex.db")
 def init_db():
     with sqlite3.connect(DB_PATH) as db:
         db.execute("""
-            CREATE TABLE IF NOT EXISTS replies_map (
-                admin_message_id INTEGER PRIMARY KEY,
-                user_chat_id INTEGER NOT NULL
+            CREATE TABLE IF NOT EXISTS replies_map_v2 (
+                admin_chat_id INTEGER NOT NULL,
+                admin_message_id INTEGER NOT NULL,
+                user_chat_id INTEGER NOT NULL,
+                PRIMARY KEY (admin_chat_id, admin_message_id)
             )
         """)
 
 
-def save_mapping(admin_message_id, user_chat_id):
+def save_mapping(admin_id, admin_message_id, user_chat_id):
     with sqlite3.connect(DB_PATH) as db:
         db.execute(
-            """INSERT OR REPLACE INTO replies_map
-               (admin_message_id, user_chat_id)
-               VALUES (?, ?)""",
-            (admin_message_id, user_chat_id),
+            """
+            INSERT OR REPLACE INTO replies_map_v2
+            (admin_chat_id, admin_message_id, user_chat_id)
+            VALUES (?, ?, ?)
+            """,
+            (admin_id, admin_message_id, user_chat_id),
         )
 
 
-def get_user_chat(admin_message_id):
+def get_user_chat(admin_id, admin_message_id):
     with sqlite3.connect(DB_PATH) as db:
         row = db.execute(
-            """SELECT user_chat_id FROM replies_map
-               WHERE admin_message_id = ?""",
-            (admin_message_id,),
+            """
+            SELECT user_chat_id FROM replies_map_v2
+            WHERE admin_chat_id = ? AND admin_message_id = ?
+            """,
+            (admin_id, admin_message_id),
         ).fetchone()
+
     return row[0] if row else None
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user and update.effective_user.id == ADMIN_ID:
-        await update.effective_message.reply_text(
-            "INNOVEX Admin is ready. User messages will arrive here."
+    message = update.effective_message
+    user = update.effective_user
+
+    if not message or not user:
+        return
+
+    if user.id in ADMIN_IDS:
+        await message.reply_text(
+            "INNOVEX Admin is ready.\n"
+            "Reply directly to a copied user message to respond."
         )
     else:
-        await update.effective_message.reply_text(
+        await message.reply_text(
             "👋 Welcome to INNOVEX Support!\n\n"
             "আপনার মেসেজ লিখে পাঠান। আমাদের টিম উত্তর দেবে।"
         )
@@ -75,30 +104,40 @@ async def receive_user_message(
     message = update.effective_message
     user = update.effective_user
 
-    if not message or not user or user.id == ADMIN_ID:
+    if not message or not user or user.id in ADMIN_IDS:
         return
 
-    try:
-        copied = await context.bot.copy_message(
-            chat_id=ADMIN_ID,
-            from_chat_id=message.chat_id,
-            message_id=message.message_id,
-        )
+    delivered = 0
 
-        save_mapping(copied.message_id, message.chat_id)
+    for admin_id in ADMIN_IDS:
+        try:
+            copied = await context.bot.copy_message(
+                chat_id=admin_id,
+                from_chat_id=message.chat_id,
+                message_id=message.message_id,
+            )
 
-        await context.bot.send_message(
-            chat_id=ADMIN_ID,
-            text=(
-                "📩 INNOVEX SUPPORT\n\n"
-                f"Name: {user.first_name}\n"
-                f"User ID: {user.id}\n"
-                "উপরের কপি করা মেসেজে Reply করে উত্তর দিন।"
-            ),
-        )
+            save_mapping(
+                admin_id,
+                copied.message_id,
+                message.chat_id,
+            )
 
-    except TelegramError:
-        log.exception("Could not forward user message")
+            await context.bot.send_message(
+                chat_id=admin_id,
+                text=(
+                    "📩 INNOVEX SUPPORT\n\n"
+                    f"Name: {user.first_name}\n"
+                    f"User ID: {user.id}\n"
+                    "উপরের কপি করা মেসেজে Reply করে উত্তর দিন।"
+                ),
+            )
+            delivered += 1
+
+        except TelegramError:
+            log.exception("Could not deliver to admin %s", admin_id)
+
+    if delivered == 0:
         try:
             await message.reply_text(
                 "দুঃখিত, মেসেজ পাঠানো যায়নি। পরে আবার চেষ্টা করুন।"
@@ -114,20 +153,20 @@ async def admin_reply(
     message = update.effective_message
     user = update.effective_user
 
-    if (
-        not message
-        or not user
-        or user.id != ADMIN_ID
-        or not message.reply_to_message
-    ):
+    if not message or not user or user.id not in ADMIN_IDS:
         return
 
-    target_id = message.reply_to_message.message_id
-    user_chat_id = get_user_chat(target_id)
+    if not message.reply_to_message:
+        return
 
-    if not user_chat_id:
+    user_chat_id = get_user_chat(
+        message.chat_id,
+        message.reply_to_message.message_id,
+    )
+
+    if user_chat_id is None:
         await message.reply_text(
-            "ইউজারের কপি করা মূল মেসেজে Reply করুন।"
+            "⚠️ ইউজারের কপি করা মূল মেসেজে Reply করুন।"
         )
         return
 
